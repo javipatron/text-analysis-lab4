@@ -1,0 +1,258 @@
+---
+title: "Lab 4"
+author: "Javier Patrón"
+date: "2023-05-08"
+output: html_document
+---
+
+# Lab 4 Assignment: Due May 9 at 11:59pm
+Load the Libraries
+```{r, include = F}
+library(tidyverse)
+library(rsample)
+library(glmnet)
+library(tidytext)
+library(tidyverse)
+library(tidymodels)
+library(textrecipes)
+library(discrim) # naive-bayes
+library(janitor)
+library(vip)
+library(kableExtra)
+```
+Read in the data
+```{r data}
+urlfile ="https://raw.githubusercontent.com/MaRo406/EDS-231-text-sentiment/main/data/climbing_reports_model_dat.csv"
+incidents_df <- readr::read_csv(url(urlfile))
+```
+
+### 1. Select a classification algorithm
+For this lab we will use the **Decision Trees** model
+
+Now we'll split our data into training and test portions
+```{r}
+
+set.seed(123)
+
+incidents_categorical <- incidents_df %>%
+  mutate(fatal = factor(if_else(is.na(Deadly) , "non-fatal", "fatal")))
+
+incidents_split <- initial_split(incidents_categorical)
+
+incidents_train <- training(incidents_split)
+incidents_test <- testing(incidents_split)
+
+```
+
+
+We use recipe() to specify the predictor and outcome variables and the data
+```{r recipe}
+incidents_rec <- recipe(fatal ~ Text, data = incidents_train)
+```
+
+Next we add some familiar pre-processing steps on our Text variable: tokenize to word level, filter to the most common words, and calculate tf-idf.
+
+```{r pre-process}
+recipe <- incidents_rec %>%
+  step_tokenize(Text) %>%
+  step_tokenfilter(Text, max_tokens = 1000) %>%
+  step_tfidf(Text) #new one from text recipes
+```
+
+
+### 2. Conduct an initial out-of-the-box model fit on the training data and prediction on the test data. Assess the performance of this initial model.
+
+Set the Model Specs
+```{r}
+# Create model specification 
+tree_spec <- decision_tree(
+  cost_complexity = tune(), 
+  tree_depth = tune(), 
+  min_n = tune()) |> 
+  set_engine("rpart") |> 
+  set_mode("classification")
+
+```
+
+Model Grid
+```{r}
+#Create a grid to be filled with your workflow
+decision_tree_grid <- grid_regular(cost_complexity(), 
+                          tree_depth(), 
+                          min_n(), 
+                          levels = 5)
+```
+
+Model Work Flow
+```{r}
+# create the workflow for this decision tree
+workflow_decisiontree <- workflow() |> 
+  add_recipe(recipe) |> 
+  add_model(tree_spec)
+
+```
+
+```{r}
+#set up k-fold CV. 
+cross_validation <- incidents_train |> 
+  vfold_cv(v = 5)
+
+```
+
+```{r}
+set.seed(123)
+doParallel::registerDoParallel() # Run build trees in parallel
+
+decision_tree_model <- tune_grid(
+  workflow_decisiontree,
+  resamples = cross_validation, 
+  grid = decision_tree_grid, # Select which grid will be used
+  metrics = metric_set(accuracy)  # which combination is the best 
+)
+
+```
+
+Use autoplot() to examine how different parameter configurations relate to accuracy
+
+```{r, fig.align='center', out.width="60%"}
+autoplot(decision_tree_model) + theme_light()
+```
+
+### 3. Select the relevant hyper-parameters for your algorithm and tune your model.
+Select the best hyperparrameters:
+```{r}
+# is you want to actually see the best values for accuracy
+show_best(decision_tree_model)
+# model has to actually use one
+select_best(decision_tree_model) # gives us the best hyper-parameters to use for our model
+```
+
+We can finalize the model specification where we have replaced the tune functions with optimized values.
+```{r final_tree_spec}
+final_tree <- finalize_workflow(workflow_decisiontree, 
+                             select_best(decision_tree_model))
+```
+
+
+### 4. Conduct a model fit using your newly tuned model specification.  What are the terms most highly associated with non-fatal reports?  What about fatal reports? 
+
+And finally, we can predict onto the testing data set.
+```{r}
+# Apply final_tree model to incidents_split dataset and collect metrics
+decision_metric <- last_fit(final_tree, incidents_split) |> 
+  collect_metrics() %>% 
+  mutate(model = "Decision Tree") # Add a new column to the metrics with  "Decision Tree"
+
+# Apply final_tree model to incidents_split dataset and collect predictions
+decision_predictions <- last_fit(final_tree,
+         incidents_split) |> 
+  collect_predictions()
+
+
+# print table with kable
+kable(decision_metric, align = "c") %>%
+  kable_styling(full_width = FALSE, position = "center", 
+                bootstrap_options = "striped", font_size = 14)
+
+```
+
+
+```{r}
+
+final_tree_fit <- fit(final_tree, 
+                           incidents_split)
+
+# Fitting our final workflow
+final_test <- final_tree_fit %>% fit(data = incidents_train)
+
+final_tree_fit %>%
+  extract_fit_parsnip() %>%
+  vip(geom = "col") +
+  theme_minimal() +
+  labs(title = "Variable Importance Plot",
+       subtitle = "Trained Data",
+       x = "Relative Importance",
+       y = "Features") +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+```
+
+```{r}
+# Fitting our final workflow
+final_test <- final_tree_fit %>% fit(data = incidents_test)
+
+final_test %>%
+  extract_fit_parsnip() %>%
+  vip(geom = "col") +
+  theme_minimal() +
+  labs(title = "Variable Importance Plot",
+       subtitle = "Tested Data",
+       x = "Relative Importance",
+       y = "Features") +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+```
+
+
+### 5. Predict fatality of the reports in the test set.  Compare this prediction performance to that of the Naive Bayes and Lasso models. 
+
+Lets first recreate the same results we got from class for the Naive Bayer and the Lasso. And we will read the results we got from our Decision Tree model when using all data split 
+```{r}
+# recreate the Lasso metrics from class
+lasso_metric <- data.frame(
+  .metric = c("accuracy", "roc_auc"),
+  .estimate = c(0.922, 0.958),
+  model = c("Lasso", "Lasso"))
+
+# recreate the Naive metrics from class
+naive_metric <- data.frame(
+  .metric = c("accuracy", "roc_auc"),
+  .estimate = c(0.801, 0.736),
+  model = c("Naive Bayes", "Naive Bayes"))
+
+# wrangle the Decision Tree metrics from class
+tidy_decision_metric <- data.frame(
+  .metric = c("accuracy", "roc_auc"),
+  .estimate = c(0.908, 0.844),
+  model = c("Decision Tree", "Decision Tree"))
+
+```
+
+Create the final table with the results of the models
+```{r}
+# Creating a table with all the results
+final_results <- bind_rows(naive_metric, lasso_metric, tidy_decision_metric)
+
+final_table <- final_results |> 
+  select(model, .metric, .estimate) |> 
+  pivot_wider(names_from = .metric, values_from = .estimate) |> 
+  arrange(accuracy) |> 
+  mutate(model = fct_reorder(model, accuracy))
+
+```
+
+Create the final Table
+```{r}
+kable(final_table,
+      padding = 1,
+      digits = round(3),
+      align = "c",
+      format = "pipe",
+      caption = "Model Comparision Summary")
+```
+
+Create the final graph comparison
+```{r}
+
+final_table %>% 
+  ggplot(aes(x = model, y = accuracy, fill = model)) +
+  geom_col() +
+  labs(title = "Final Model Graph Comparison",
+       x = "Type of Model",
+       y = "Model's Accuracy") +
+  geom_text(size = 5, aes(label = round(accuracy, 3), y = accuracy + 0.05),
+            vjust = 1, color = "gray30") +
+  scale_fill_brewer(palette = "Set1") +
+  theme_minimal()
+
+```
